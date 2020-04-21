@@ -1,8 +1,9 @@
 module github.com/ianatha/service
 
-go 1.10
+go 1.13
 
 require (
-	github.com/ianatha/service v1.0.0
-	golang.org/x/sys v0.0.0-20190204203706-41f3e6584952
+	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0
+	github.com/winlabs/gowin32 v0.0.0-20200320162817-4ab323eca3ad
+	golang.org/x/sys v0.0.0-20200420163511-1957bb5e6d1f
 )

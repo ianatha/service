@@ -6,6 +6,11 @@ package service
 
 import (
 	"fmt"
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
+	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/eventlog"
+	"golang.org/x/sys/windows/svc/mgr"
 	"log"
 	"os"
 	"os/signal"
@@ -13,14 +18,86 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/sys/windows/registry"
-	"golang.org/x/sys/windows/svc"
-	"golang.org/x/sys/windows/svc/eventlog"
-	"golang.org/x/sys/windows/svc/mgr"
+	"unsafe"
 )
 
 const version = "windows-service"
+
+type WindowsEvent struct {
+	MsgId     svc.Cmd
+	MsgType   uint32
+	SessionId uint32
+	SID       *windows.SID
+
+}
+
+func (w *WindowsEvent) String() string {
+	sid := w.SID.String()
+
+	return fmt.Sprintf(
+		`MsgId=%s, MsgType=%s [session=%d, sid=%s]`,
+		CmdToString(w.MsgId),
+		MsgTypeToString(w.MsgType),
+		w.SessionId,
+		sid,
+		)
+}
+
+const (
+	WTS_CONSOLE_CONNECT = 0x1
+	WTS_CONSOLE_DISCONNECT     = 0x2
+	WTS_REMOTE_CONNECT         = 0x3
+	WTS_REMOTE_DISCONNECT      = 0x4
+	WTS_SESSION_LOGON          = 0x5
+	WTS_SESSION_LOGOFF         = 0x6
+	WTS_SESSION_LOCK           = 0x7
+	WTS_SESSION_UNLOCK         = 0x8
+	WTS_SESSION_REMOTE_CONTROL = 0x9
+	WTS_SESSION_CREATE         = 0xA
+	WTS_SESSION_TERMINATE      = 0xB
+)
+
+func MsgTypeToString(msgType uint32) string {
+	switch msgType {
+	case WTS_CONSOLE_CONNECT: return "WTS_CONSOLE_CONNECT"
+	case WTS_CONSOLE_DISCONNECT: return "WTS_CONSOLE_DISCONNECT"
+	case WTS_REMOTE_CONNECT: return "WTS_REMOTE_CONNECT"
+	case WTS_REMOTE_DISCONNECT: return "WTS_REMOTE_DISCONNECT"
+	case WTS_SESSION_LOGON: return "WTS_SESSION_LOGON"
+	case WTS_SESSION_LOGOFF: return "WTS_SESSION_LOGOFF"
+	case WTS_SESSION_LOCK: return "WTS_SESSION_LOCK"
+	case WTS_SESSION_UNLOCK: return "WTS_SESSION_UNLOCK"
+	case WTS_SESSION_REMOTE_CONTROL: return "WTS_SESSION_REMOTE_CONTROL"
+	case WTS_SESSION_CREATE: return "WTS_SESSION_CREATE"
+	case WTS_SESSION_TERMINATE: return "WTS_SESSION_TERMINATE"
+	default: return "Unknown"
+	}
+}
+
+func CmdToString(id svc.Cmd) string {
+	switch id {
+	case svc.SessionChange: return "SessionChange"
+	case svc.Stop: return "Stop"
+	case svc.Pause: return "Pause"
+	case svc.Continue: return "Continue"
+	case svc.Interrogate: return "Interrogate"
+	default:
+		return "Unknown"
+
+		//Shutdown              = Cmd(windows.SERVICE_CONTROL_SHUTDOWN)
+		//ParamChange           = Cmd(windows.SERVICE_CONTROL_PARAMCHANGE)
+		//NetBindAdd            = Cmd(windows.SERVICE_CONTROL_NETBINDADD)
+		//NetBindRemove         = Cmd(windows.SERVICE_CONTROL_NETBINDREMOVE)
+		//NetBindEnable         = Cmd(windows.SERVICE_CONTROL_NETBINDENABLE)
+		//NetBindDisable        = Cmd(windows.SERVICE_CONTROL_NETBINDDISABLE)
+		//DeviceEvent           = Cmd(windows.SERVICE_CONTROL_DEVICEEVENT)
+		//HardwareProfileChange = Cmd(windows.SERVICE_CONTROL_HARDWAREPROFILECHANGE)
+		//PowerEvent            = Cmd(windows.SERVICE_CONTROL_POWEREVENT)
+		//SessionChange         = Cmd(windows.SERVICE_CONTROL_SESSIONCHANGE)
+
+	}
+}
+
 
 type windowsService struct {
 	i Interface
@@ -28,6 +105,8 @@ type windowsService struct {
 
 	errSync      sync.Mutex
 	stopStartErr error
+
+	ExtraEventsChannel chan WindowsEvent
 }
 
 // WindowsLogger allows using windows specific logging methods.
@@ -51,6 +130,7 @@ func (windowsSystem) New(i Interface, c *Config) (Service, error) {
 	ws := &windowsService{
 		i:      i,
 		Config: c,
+		ExtraEventsChannel: c.WindowsExtraEvents,
 	}
 	return ws, nil
 }
@@ -161,8 +241,16 @@ func (ws *windowsService) getError() error {
 	return ws.stopStartErr
 }
 
+const WTS_CURRENT_SERVER_HANDLE = 0
+
 func (ws *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
-	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptNetBindChange | svc.AcceptHardwareProfileChange | svc.AcceptSessionChange
+	cmdsAccepted := svc.AcceptStop | svc.AcceptShutdown
+
+	if ws.ExtraEventsChannel != nil {
+		cmdsAccepted |= svc.AcceptNetBindChange | svc.AcceptHardwareProfileChange | svc.AcceptSessionChange
+		defer close(ws.ExtraEventsChannel)
+	}
+
 	changes <- svc.Status{State: svc.StartPending}
 
 	if err := ws.i.Start(ws); err != nil {
@@ -184,8 +272,78 @@ loop:
 				return true, 2
 			}
 			break loop
-		case svc.SessionChange, svc.HardwareProfileChange, svc.SessionChange:
-			log.Printf("SERVICE STATUS MESSAGE RECEIVED: %v", c.Cmd)
+		case svc.SessionChange:
+			if ws.ExtraEventsChannel == nil {
+				continue loop
+			}
+
+			// c.EventType can be WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_LOGON, etc....
+
+			// https://docs.microsoft.com/en-us/windows/win32/termserv/wm-wtssession-change
+			//if c.EventType != windows.WTS_SESSION_LOGON && c.EventType != windows.WTS_SESSION_LOGOFF {
+			//	continue
+			//}
+			//
+			//defaultWTSServer := &gowin32.WTSServer{
+			//	WTS_CURRENT_SERVER_HANDLE,
+			//}
+
+			sessionNotification := (*WTSSESSION_NOTIFICATION)(unsafe.Pointer(c.EventData))
+			if uintptr(sessionNotification.Size) != unsafe.Sizeof(*sessionNotification) {
+				log.Printf("Unexpected size of WTSSESSION_NOTIFICATION: %d", sessionNotification.Size)
+				continue
+			}
+			sessionId := sessionNotification.SessionId
+
+			wts := OpenWTSServer("")
+			inf, err := wts.QuerySessionSesionInfo(uint(sessionId))
+			log.Printf("%v, %v", inf, err)
+
+
+			//if c.EventType == windows.WTS_SESSION_LOGOFF {
+			//	procsLock.Lock()
+			//	delete(aliveSessions, sessionNotification.SessionID)
+			//	if proc, ok := procs[sessionNotification.SessionID]; ok {
+			//		proc.Kill()
+			//	}
+			//	procsLock.Unlock()
+			//} else if c.EventType == windows.WTS_SESSION_LOGON {
+			//	procsLock.Lock()
+			//	if alive := aliveSessions[sessionNotification.SessionID]; !alive {
+			//		aliveSessions[sessionNotification.SessionID] = true
+			//		if _, ok := procs[sessionNotification.SessionID]; !ok {
+			//			goStartProcess(sessionNotification.SessionID)
+			//		}
+			//	}
+			//	procsLock.Unlock()
+			//}
+
+			var hToken windows.Handle
+			err = WTSQueryUserToken(sessionId, &hToken)
+			if err != nil {
+				log.Printf("ERROR ERROR (session:%d): %v", sessionId, err)
+				continue
+			}
+			defer windows.CloseHandle(hToken)
+
+			sid, err := GetTokenUser(windows.Handle(hToken))
+			if err != nil {
+				log.Printf("ERROR ERROR2 (session:%d): %v", sessionId, err)
+				continue
+			}
+
+			ws.ExtraEventsChannel <- WindowsEvent{
+				MsgId: c.Cmd,
+				MsgType: c.EventType,
+				SessionId: sessionNotification.SessionId,
+				SID: sid,
+			}
+
+			if (c.Cmd == 14 && c.Cmd == 5) {
+				log.Printf("running command as new user")
+				//go winsessions.RunAdminCommandAsLoggedInUser(hToken)
+				log.Printf("done run command")
+			}
 		default:
 			continue loop
 		}

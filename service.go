@@ -148,6 +148,8 @@ type Config struct {
 	//    - SuccessExitStatus string ()             - The list of exit status that shall be considered as successful,
 	//                                                in addition to the default ones.
 	Option KeyValue
+
+	WindowsExtraEvents chan WindowsEvent
 }
 
 var (
