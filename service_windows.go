@@ -457,6 +457,7 @@ func (ws *windowsService) Status() (Status, error) {
 		}
 		return StatusUnknown, err
 	}
+	defer s.Close()
 
 	status, err := s.Query()
 	if err != nil {
